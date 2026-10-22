@@ -367,3 +367,124 @@ fn invalid_identifiers_and_uncreated_sessions_fail_closed() {
         Err(Error::UnknownSession)
     );
 }
+
+#[test]
+fn every_terminal_outcome_rejects_all_lifecycle_mutations() {
+    for (outcome, expected) in [
+        (Outcome::Succeeded, RequestState::Succeeded),
+        (Outcome::Failed, RequestState::Failed),
+        (Outcome::Unknown, RequestState::OutcomeUnknown),
+    ] {
+        let (mut core, request) = approved();
+        let permit = core.begin(&request).unwrap();
+        core.finish(&permit, outcome).unwrap();
+        let denied = Err(Error::InvalidState(expected));
+        assert_eq!(
+            core.begin(&request).unwrap_err(),
+            Error::InvalidState(expected)
+        );
+        assert_eq!(
+            core.approve(&request, approver(request.scope().clone())),
+            denied
+        );
+        assert_eq!(core.cancel_request(request.scope(), request.id()), denied);
+        assert_eq!(core.revoke_approval(request.scope(), request.id()), denied);
+        for later in [Outcome::Succeeded, Outcome::Failed, Outcome::Unknown] {
+            assert_eq!(core.finish(&permit, later), denied);
+        }
+        assert_eq!(core.submit(request.clone()), Err(Error::DuplicateRequest));
+        assert_eq!(core.state(request.scope(), request.id()), Ok(expected));
+    }
+}
+
+#[test]
+fn session_cancellation_preserves_terminal_results_and_other_scopes() {
+    let mut core = ControlPlane::new();
+    let cancelled_scope = scope("tenant-1", "session-1");
+    core.create_session(cancelled_scope.clone()).unwrap();
+    let states = [
+        RequestState::PendingApproval,
+        RequestState::Approved,
+        RequestState::Executing,
+        RequestState::Succeeded,
+        RequestState::Failed,
+        RequestState::OutcomeUnknown,
+        RequestState::Cancelled,
+        RequestState::Revoked,
+    ];
+    let mut requests = Vec::new();
+    for (index, state) in states.into_iter().enumerate() {
+        let original = request(cancelled_scope.clone());
+        let request = ToolRequest::new(
+            cancelled_scope.clone(),
+            RequestId::new(format!("request-{index}")).unwrap(),
+            original.identity().clone(),
+            original.tool(),
+            original.target(),
+            original.arguments(),
+            original.effect(),
+        )
+        .unwrap();
+        core.submit(request.clone()).unwrap();
+        match state {
+            RequestState::PendingApproval => {}
+            RequestState::Cancelled => core.cancel_request(request.scope(), request.id()).unwrap(),
+            RequestState::Revoked => core.revoke_approval(request.scope(), request.id()).unwrap(),
+            _ => {
+                core.approve(&request, approver(cancelled_scope.clone()))
+                    .unwrap();
+                if state != RequestState::Approved {
+                    let permit = core.begin(&request).unwrap();
+                    let outcome = match state {
+                        RequestState::Succeeded => Some(Outcome::Succeeded),
+                        RequestState::Failed => Some(Outcome::Failed),
+                        RequestState::OutcomeUnknown => Some(Outcome::Unknown),
+                        _ => None,
+                    };
+                    if let Some(outcome) = outcome {
+                        core.finish(&permit, outcome).unwrap();
+                    }
+                }
+            }
+        }
+        assert_eq!(core.state(request.scope(), request.id()), Ok(state));
+        requests.push(request);
+    }
+    let others: Vec<_> = [
+        scope("tenant-2", "session-1"),
+        scope("tenant-1", "session-2"),
+    ]
+    .into_iter()
+    .map(|scope| {
+        core.create_session(scope.clone()).unwrap();
+        let request = request(scope.clone());
+        core.submit(request.clone()).unwrap();
+        core.approve(&request, approver(scope)).unwrap();
+        request
+    })
+    .collect();
+
+    // Repeated cancellation must remain idempotent and must not rewrite results.
+    for _ in 0..2 {
+        core.cancel_session(&cancelled_scope).unwrap();
+        for (request, before) in requests.iter().zip(states) {
+            let expected = match before {
+                RequestState::PendingApproval | RequestState::Approved => RequestState::Cancelled,
+                RequestState::Executing => RequestState::OutcomeUnknown,
+                terminal => terminal,
+            };
+            assert_eq!(core.state(request.scope(), request.id()), Ok(expected));
+        }
+        for request in &others {
+            assert_eq!(core.session_cancelled(request.scope()), Ok(false));
+            assert_eq!(
+                core.state(request.scope(), request.id()),
+                Ok(RequestState::Approved)
+            );
+        }
+    }
+    for request in &others {
+        let permit = core.begin(request).unwrap();
+        core.finish(&permit, Outcome::Succeeded).unwrap();
+    }
+}

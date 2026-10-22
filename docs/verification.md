@@ -21,3 +21,21 @@ Reviewed source SHA256 (before Git commit):
 - `apps/openquick/tests/cli.rs`: `ded1f62d78c49d0ac9f72390cd4885a83facedd5f1c345aed3aba3315c64db9a`
 
 CLI composition review: `demo` creates credential-free synthetic requests, exercises explicit approval, unavailable dispatch, unknown no-retry, cancellation and revocation. A disabled dispatch is recorded as a confirmed local failure; synthetic unknown is clearly labeled separately. `gateway` returns exit 1 and claims no dispatch; unsupported arguments exit 2 without work. Status discloses all unavailable integrations. No must-fix CLI correctness issue observed.
+
+## Additional terminal-state acceptance (2026-10-22)
+
+Reviewed immutable PR head `a7b31a4420883a51b3874b36357ad483e6e895e5` in a separate source snapshot. No implementation defect was found; this update adds two acceptance tests without changing runtime behavior:
+
+- Every completed outcome rejects approval, another begin, cancellation, revocation, repeated finish with any outcome, and reuse of the request ID; the recorded result stays unchanged.
+- A session containing all eight request states cancels queued requests, makes executing requests uncertain, preserves terminal results across repeated cancellation, and leaves both another tenant's same-named session and a sibling session executable.
+
+The available local cached toolchain was Rust/Cargo **1.99.1**, not the repository-pinned 1.90.0. Commands deliberately used `cargo +stable`; the pin was not changed. Baseline: 12 core integration tests, 5 CLI tests, 1 gateway test passed. Updated: 14 core integration tests, 5 CLI tests, 1 gateway test passed. `cargo +stable fmt --all -- --check`, `cargo +stable clippy --workspace --all-targets --locked -- -D warnings`, `cargo +stable test --workspace --locked`, and `cargo +stable build --workspace --release --locked` each exited 0. These local results do not establish pinned-toolchain or remote-CI success.
+
+Two isolated mutation checks demonstrated that the new assertions detect meaningful regressions. In each case, only a disposable source copy was mutated; the submitted implementation stayed unchanged:
+
+1. Allowing `cancel_request` to cancel a `Failed` request caused `every_terminal_outcome_rejects_all_lifecycle_mutations` to fail (exit 101, `Ok(())` rather than `Err(InvalidState(Failed))`). Restoring the implementation made the same exact test pass (exit 0).
+2. Replacing the terminal-state preservation arm in `cancel_session` with `Cancelled` caused `session_cancellation_preserves_terminal_results_and_other_scopes` to fail (exit 101, `Cancelled` rather than `Succeeded`). Restoring the implementation made the same exact test pass (exit 0).
+
+For each mutation the command was `cargo +stable test -p openquick-core --test control_plane --locked TEST_NAME -- --exact`. This is synthetic trusted-library acceptance only; durable recovery, authentication, actual dispatch and external effects remain unimplemented and untested.
+
+Independent review subsequently made the pinned Rust/Cargo **1.90.0** toolchain available and verified the updated snapshot with `cargo +1.90.0 test --workspace --locked` (14 core integration tests, 5 CLI tests, 1 gateway test), `cargo +1.90.0 fmt --all -- --check`, `cargo +1.90.0 clippy --workspace --all-targets --locked -- -D warnings`, and `cargo +1.90.0 build --workspace --release --locked`; all exited 0. This establishes local pinned-toolchain success for the updated snapshot, not remote-CI success. The earlier 1.99.1 baseline and mutation results remain separate evidence.

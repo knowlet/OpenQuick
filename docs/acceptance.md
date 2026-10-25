@@ -4,7 +4,7 @@ This document separates local control-plane acceptance from unavailable product 
 
 ## Local acceptance matrix
 
-The following cases define the executable acceptance surface. All local cases passed on 2026-10-21; commands, test counts and the independently reviewed source fingerprints are recorded below and in the [verification evidence](verification.md).
+The following cases define the executable acceptance surface. Initial local results are recorded below; the 2026-10-25 offline public-API/gateway composition and concurrency checks are recorded in the [verification evidence](verification.md#offline-composition-and-concurrency-2026-10-25).
 
 | Case | Required observable behavior |
 | --- | --- |
@@ -21,6 +21,9 @@ The following cases define the executable acceptance surface. All local cases pa
 | Terminal result | A completed request cannot be executed again using its previous approval |
 | Unavailable gateway | Availability and dispatch return an explicit integration-unavailable error |
 | CLI smoke | `status` and `demo` complete locally; `gateway` returns nonzero with an unavailable message; invalid commands fail |
+| Concurrent trusted callers | With caller-owned serialization, 16 contenders obtain exactly one permit and record exactly one terminal result |
+| Cancellation/dispatch windows | Request cancellation, approval revocation and session cancellation have deterministic before-begin, before-dispatch, before-finish and after-finish cases; simultaneous begin/cancel and finish/cancel produce only legal results |
+| Observed offline effects | The actual release CLI and public-API/gateway test executable make no observed network calls, file mutations or child-process launches under Linux syscall tracing |
 
 Tests must cover both allowed and rejected transitions, including cross-tenant/session substitutions. The core is a trusted library; these cases do not authenticate an attacker or validate a network authorization boundary.
 
@@ -45,6 +48,18 @@ cargo run -p openquick --locked -- gateway
 ```
 
 The last command must return nonzero. No command should contact a model, an IdP, AgentGateway or a real tool.
+
+Offline composition and effect observation on Linux, after installing the pinned toolchain plus Python 3 and `strace`:
+
+```sh
+cargo test -p openquick --test offline_control_plane --locked --offline
+cargo build --workspace --release --locked --offline
+python3 scripts/verify_offline.py --output-dir /tmp/openquick-offline-evidence
+```
+
+See the [verification record](verification.md#offline-composition-and-concurrency-2026-10-25) for tracing the integration-test executable, mutation controls and stress counts. The observer is a test, not a sandbox: it rejects unexpected effects after observing an execution. Its artifacts are outside the repository. No trace result authorizes connecting a real tool.
+
+The core requires `&mut self`; concurrency tests serialize trusted callers with a mutex and use barriers/channels, not timing sleeps. The current gateway always returns `IntegrationUnavailable`, including for a retained permit after cancellation. These tests validate that closed boundary and recorded local outcomes; they do not establish live cancellation revalidation, actual remote dispatch safety, or distributed exclusion.
 
 ## Verification record
 

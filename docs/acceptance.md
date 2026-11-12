@@ -37,6 +37,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --release --locked
 cargo test -p openquick --test cli --locked
+cargo test -p openquick-core --test journal_recovery --locked
 ```
 
 CLI manual smoke:
@@ -85,7 +86,7 @@ These local results describe the implementation files bundled with this record, 
 
 | Area | Current limitation / future evidence required |
 | --- | --- |
-| Durable execution | In-memory only; restart loses state. No journal, recovery, crash injection or power-loss test is implemented |
+| Durable execution | Append-only journal can replay in-process state after restart; no multi-writer exclusion, crash mid-record certification, or power-loss test |
 | Authenticated identity | OBO and Machine are data variants only. No IdP/token/consent/authentication integration |
 | Approver authorization | Trusted library callers provide approvals. No verified human identity, approval UI or role policy |
 | AgentGateway | No process launch, network connection, proxy routing, credential brokerage or retry-policy integration |

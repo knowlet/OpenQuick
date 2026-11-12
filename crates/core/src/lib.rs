@@ -4,6 +4,11 @@
 //! isolate workers. The caller must establish identity and authorization before
 //! recording an approval. Credentials must never be included in a request.
 //! Approval compares the complete request bytes; no normalization is performed.
+//!
+//! Optional append-only journaling lives in [`journal`] for restart recovery of
+//! in-process state; it is not a distributed or crash-certified store.
+
+pub mod journal;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -206,7 +211,7 @@ pub enum Outcome {
 ///
 /// A permit is an in-process lifecycle handle, not a serialized authorization
 /// capability. It does not by itself authorize a future gateway to dispatch.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExecutionPermit {
     issuer: Arc<()>,
     request: ToolRequest,

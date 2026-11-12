@@ -1,0 +1,175 @@
+use openquick_core::journal::{
+    JournalError, JournalEvent, JournaledControlPlane, decode_events, encode_events, replay_events,
+};
+use openquick_core::{
+    Approver, ControlPlane, EffectKind, Identity, Outcome, PrincipalId, RequestId, RequestState,
+    SessionId, SessionScope, TenantId, ToolRequest,
+};
+
+fn scope(tenant: &str, session: &str) -> SessionScope {
+    SessionScope::new(
+        TenantId::new(tenant).unwrap(),
+        SessionId::new(session).unwrap(),
+    )
+}
+
+fn sample_request(scope: SessionScope, id: &str) -> ToolRequest {
+    ToolRequest::new(
+        scope,
+        RequestId::new(id).unwrap(),
+        Identity::OnBehalfOf {
+            subject: PrincipalId::new("user-1").unwrap(),
+        },
+        "send_message",
+        "channel-1",
+        br#"{"message":"hello"}"#.to_vec(),
+        EffectKind::ExternalWrite,
+    )
+    .unwrap()
+}
+
+#[test]
+fn journal_round_trip_encoding() {
+    let session = scope("tenant-1", "session-1");
+    let request = sample_request(session.clone(), "request-1");
+    let events = vec![
+        JournalEvent::CreateSession(session.clone()),
+        JournalEvent::Submit(request.clone()),
+        JournalEvent::Approve {
+            request: request.clone(),
+            approver: Approver::new(session.clone(), PrincipalId::new("reviewer-1").unwrap()),
+        },
+        JournalEvent::Begin(request.clone()),
+        JournalEvent::Finish {
+            request: request.clone(),
+            outcome: Outcome::Succeeded,
+        },
+    ];
+    let encoded = encode_events(&events).unwrap();
+    assert_eq!(decode_events(&encoded).unwrap(), events);
+}
+
+#[test]
+fn restart_replays_terminal_lifecycle() {
+    let dir = std::env::temp_dir().join(format!("openquick-journal-{}", std::process::id()));
+    let _ = std::fs::remove_file(&dir);
+    let session = scope("tenant-1", "session-1");
+    let request = sample_request(session.clone(), "request-1");
+
+    {
+        let mut plane = JournaledControlPlane::open(&dir).unwrap();
+        plane.create_session(session.clone()).unwrap();
+        plane.submit(request.clone()).unwrap();
+        plane
+            .approve(
+                &request,
+                Approver::new(session.clone(), PrincipalId::new("reviewer-1").unwrap()),
+            )
+            .unwrap();
+        let permit = plane.begin(&request).unwrap();
+        plane.finish(&permit, Outcome::Succeeded).unwrap();
+    }
+
+    let (plane, events) = JournaledControlPlane::recover(&dir).unwrap();
+    assert_eq!(events.len(), 5);
+    assert_eq!(
+        plane.state(request.scope(), request.id()).unwrap(),
+        RequestState::Succeeded
+    );
+    let _ = std::fs::remove_file(&dir);
+}
+
+#[test]
+fn restart_preserves_in_flight_intent() {
+    let dir =
+        std::env::temp_dir().join(format!("openquick-journal-inflight-{}", std::process::id()));
+    let _ = std::fs::remove_file(&dir);
+    let session = scope("tenant-2", "session-2");
+    let request = sample_request(session.clone(), "request-2");
+
+    {
+        let mut plane = JournaledControlPlane::open(&dir).unwrap();
+        plane.create_session(session.clone()).unwrap();
+        plane.submit(request.clone()).unwrap();
+        plane
+            .approve(
+                &request,
+                Approver::new(session.clone(), PrincipalId::new("reviewer-1").unwrap()),
+            )
+            .unwrap();
+        let _permit = plane.begin(&request).unwrap();
+    }
+
+    let (mut plane, _) = JournaledControlPlane::recover(&dir).unwrap();
+    assert_eq!(
+        plane.state(request.scope(), request.id()).unwrap(),
+        RequestState::Executing
+    );
+    assert_eq!(plane.outstanding_permits().len(), 1);
+    assert!(matches!(
+        plane.begin(&request),
+        Err(JournalError::Replay(openquick_core::Error::InvalidState(
+            RequestState::Executing
+        )))
+    ));
+
+    let permit = plane
+        .outstanding_permits()
+        .get(request.id())
+        .cloned()
+        .expect("in-flight permit after replay");
+    plane.finish(&permit, Outcome::Unknown).unwrap();
+    assert_eq!(
+        plane.state(request.scope(), request.id()).unwrap(),
+        RequestState::OutcomeUnknown
+    );
+    let _ = std::fs::remove_file(&dir);
+}
+
+#[test]
+fn memory_replay_matches_direct_operations() {
+    let session = scope("tenant-3", "session-3");
+    let request = sample_request(session.clone(), "request-3");
+    let mut direct = ControlPlane::new();
+    direct.create_session(session.clone()).unwrap();
+    direct.submit(request.clone()).unwrap();
+    direct
+        .approve(
+            &request,
+            Approver::new(session.clone(), PrincipalId::new("reviewer-1").unwrap()),
+        )
+        .unwrap();
+    let permit = direct.begin(&request).unwrap();
+    direct
+        .cancel_request(request.scope(), request.id())
+        .unwrap();
+    drop(permit);
+
+    let events = vec![
+        JournalEvent::CreateSession(session.clone()),
+        JournalEvent::Submit(request.clone()),
+        JournalEvent::Approve {
+            request: request.clone(),
+            approver: Approver::new(session.clone(), PrincipalId::new("reviewer-1").unwrap()),
+        },
+        JournalEvent::Begin(request.clone()),
+        JournalEvent::CancelRequest {
+            scope: session.clone(),
+            id: request.id().clone(),
+        },
+    ];
+    let mut replayed = ControlPlane::new();
+    assert!(replay_events(&mut replayed, &events).unwrap().is_empty());
+    assert_eq!(
+        replayed.state(request.scope(), request.id()).unwrap(),
+        direct.state(request.scope(), request.id()).unwrap()
+    );
+}
+
+#[test]
+fn invalid_journal_blob_is_rejected() {
+    assert!(matches!(
+        decode_events(b"BAD"),
+        Err(JournalError::InvalidFormat)
+    ));
+}

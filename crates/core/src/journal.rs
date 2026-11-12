@@ -80,7 +80,7 @@ use std::fmt;
 pub struct JournaledControlPlane {
     core: ControlPlane,
     journal: JournalWriter,
-    outstanding: BTreeMap<RequestId, ExecutionPermit>,
+    outstanding: BTreeMap<(SessionScope, RequestId), ExecutionPermit>,
 }
 
 impl JournaledControlPlane {
@@ -108,7 +108,8 @@ impl JournaledControlPlane {
         ))
     }
 
-    pub fn outstanding_permits(&self) -> &BTreeMap<RequestId, ExecutionPermit> {
+    /// In-flight permits keyed by full tenant/session scope and request ID.
+    pub fn outstanding_permits(&self) -> &BTreeMap<(SessionScope, RequestId), ExecutionPermit> {
         &self.outstanding
     }
 
@@ -158,8 +159,10 @@ impl JournaledControlPlane {
 
     pub fn begin(&mut self, request: &ToolRequest) -> Result<ExecutionPermit, JournalError> {
         let permit = self.core.begin(request).map_err(JournalError::Replay)?;
-        self.outstanding
-            .insert(request.id().clone(), permit.clone());
+        self.outstanding.insert(
+            (request.scope().clone(), request.id().clone()),
+            permit.clone(),
+        );
         self.record(JournalEvent::Begin(request.clone()))?;
         Ok(permit)
     }
@@ -173,7 +176,8 @@ impl JournaledControlPlane {
         self.core
             .finish(permit, outcome)
             .map_err(JournalError::Replay)?;
-        self.outstanding.remove(request.id());
+        self.outstanding
+            .remove(&(request.scope().clone(), request.id().clone()));
         self.record(JournalEvent::Finish { request, outcome })?;
         Ok(())
     }
@@ -186,7 +190,7 @@ impl JournaledControlPlane {
         self.core
             .cancel_request(scope, id)
             .map_err(JournalError::Replay)?;
-        self.outstanding.remove(id);
+        self.outstanding.remove(&(scope.clone(), id.clone()));
         self.record(JournalEvent::CancelRequest {
             scope: scope.clone(),
             id: id.clone(),
@@ -202,7 +206,7 @@ impl JournaledControlPlane {
         self.core
             .revoke_approval(scope, id)
             .map_err(JournalError::Replay)?;
-        self.outstanding.remove(id);
+        self.outstanding.remove(&(scope.clone(), id.clone()));
         self.record(JournalEvent::RevokeApproval {
             scope: scope.clone(),
             id: id.clone(),
@@ -214,7 +218,8 @@ impl JournaledControlPlane {
         self.core
             .cancel_session(scope)
             .map_err(JournalError::Replay)?;
-        self.outstanding.clear();
+        self.outstanding
+            .retain(|(permit_scope, _), _| permit_scope != scope);
         self.record(JournalEvent::CancelSession(scope.clone()))?;
         Ok(())
     }
@@ -317,8 +322,8 @@ pub fn decode_events(bytes: &[u8]) -> Result<Vec<JournalEvent>, JournalError> {
 pub fn replay_events(
     core: &mut ControlPlane,
     events: &[JournalEvent],
-) -> Result<BTreeMap<RequestId, ExecutionPermit>, JournalError> {
-    let mut permits: BTreeMap<RequestId, ExecutionPermit> = BTreeMap::new();
+) -> Result<BTreeMap<(SessionScope, RequestId), ExecutionPermit>, JournalError> {
+    let mut permits: BTreeMap<(SessionScope, RequestId), ExecutionPermit> = BTreeMap::new();
     for event in events {
         match event {
             JournalEvent::CreateSession(scope) => {
@@ -334,11 +339,11 @@ pub fn replay_events(
             }
             JournalEvent::Begin(request) => {
                 let permit = core.begin(request).map_err(JournalError::Replay)?;
-                permits.insert(request.id().clone(), permit);
+                permits.insert((request.scope().clone(), request.id().clone()), permit);
             }
             JournalEvent::Finish { request, outcome } => {
                 let permit = permits
-                    .remove(request.id())
+                    .remove(&(request.scope().clone(), request.id().clone()))
                     .ok_or(JournalError::InvalidFormat)?;
                 core.finish(&permit, *outcome)
                     .map_err(JournalError::Replay)?;
@@ -346,16 +351,16 @@ pub fn replay_events(
             JournalEvent::CancelRequest { scope, id } => {
                 core.cancel_request(scope, id)
                     .map_err(JournalError::Replay)?;
-                permits.remove(id);
+                permits.remove(&(scope.clone(), id.clone()));
             }
             JournalEvent::RevokeApproval { scope, id } => {
                 core.revoke_approval(scope, id)
                     .map_err(JournalError::Replay)?;
-                permits.remove(id);
+                permits.remove(&(scope.clone(), id.clone()));
             }
             JournalEvent::CancelSession(scope) => {
                 core.cancel_session(scope).map_err(JournalError::Replay)?;
-                permits.clear();
+                permits.retain(|(permit_scope, _), _| permit_scope != scope);
             }
         }
     }

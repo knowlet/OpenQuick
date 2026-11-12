@@ -101,3 +101,7 @@ These local results describe the implementation files bundled with this record, 
 ## Next integration gate
 
 Before enabling external writes, add durable intent/outcome storage and restart tests; authenticated user/service context and approver authorization; a real AgentGateway adapter with explicit write retry policy; and cancellation/revocation checks at the actual dispatch boundary. Test credential handling and isolation independently. These are remaining work, not security properties supplied by the current unavailable gateway.
+
+### Journal scope isolation
+
+Outstanding permits use `(SessionScope, RequestId)` keys, matching the core request namespace. Cancelling a session or cancelling/revoking a request removes only permits in the target scope. Regression tests cover identical IDs across tenants and sessions, restart recovery, terminal replay, and scoped cancellation/revocation. The journal wire format is unchanged; callers of the new draft API must use the scoped key when inspecting `outstanding_permits()` or `replay_events()`. These tests do not certify power-loss recovery or external gateway execution.

@@ -115,7 +115,7 @@ fn restart_preserves_in_flight_intent() {
 
     let permit = plane
         .outstanding_permits()
-        .get(request.id())
+        .get(&(request.scope().clone(), request.id().clone()))
         .cloned()
         .expect("in-flight permit after replay");
     plane.finish(&permit, Outcome::Unknown).unwrap();
@@ -172,4 +172,107 @@ fn invalid_journal_blob_is_rejected() {
         decode_events(b"BAD"),
         Err(JournalError::InvalidFormat)
     ));
+}
+
+#[test]
+fn restart_keeps_identical_request_ids_in_distinct_scopes() {
+    for (label, other_scope) in [
+        ("session", scope("tenant-1", "session-2")),
+        ("tenant", scope("tenant-2", "session-1")),
+    ] {
+        let path =
+            std::env::temp_dir().join(format!("openquick-scoped-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let requests = [
+            sample_request(scope("tenant-1", "session-1"), "same-id"),
+            sample_request(other_scope, "same-id"),
+        ];
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        for request in &requests {
+            plane.create_session(request.scope().clone()).unwrap();
+            plane.submit(request.clone()).unwrap();
+            plane
+                .approve(
+                    request,
+                    Approver::new(
+                        request.scope().clone(),
+                        PrincipalId::new("reviewer").unwrap(),
+                    ),
+                )
+                .unwrap();
+            plane.begin(request).unwrap();
+        }
+        assert_eq!(plane.outstanding_permits().len(), 2);
+        drop(plane);
+        let (mut plane, _) = JournaledControlPlane::recover(&path).unwrap();
+        assert_eq!(plane.outstanding_permits().len(), 2);
+        let permits: Vec<_> = plane.outstanding_permits().values().cloned().collect();
+        for permit in permits {
+            plane.finish(&permit, Outcome::Succeeded).unwrap();
+        }
+        drop(plane);
+        let (plane, _) = JournaledControlPlane::recover(&path).unwrap();
+        for request in &requests {
+            assert_eq!(
+                plane.state(request.scope(), request.id()).unwrap(),
+                RequestState::Succeeded
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[test]
+fn cancellation_only_removes_permits_in_target_scope() {
+    for operation in ["session", "request", "revoke"] {
+        let path = std::env::temp_dir().join(format!(
+            "openquick-cancel-{operation}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let requests = [
+            sample_request(scope("tenant-1", "session-1"), "same-id"),
+            sample_request(scope("tenant-2", "session-1"), "same-id"),
+        ];
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        for request in &requests {
+            plane.create_session(request.scope().clone()).unwrap();
+            plane.submit(request.clone()).unwrap();
+            plane
+                .approve(
+                    request,
+                    Approver::new(
+                        request.scope().clone(),
+                        PrincipalId::new("reviewer").unwrap(),
+                    ),
+                )
+                .unwrap();
+            plane.begin(request).unwrap();
+        }
+        if operation == "session" {
+            plane.cancel_session(requests[0].scope()).unwrap();
+        } else if operation == "revoke" {
+            plane
+                .revoke_approval(requests[0].scope(), requests[0].id())
+                .unwrap();
+        } else {
+            plane
+                .cancel_request(requests[0].scope(), requests[0].id())
+                .unwrap();
+        }
+        assert_eq!(plane.outstanding_permits().len(), 1);
+        drop(plane);
+        let (mut plane, _) = JournaledControlPlane::recover(&path).unwrap();
+        assert_eq!(plane.outstanding_permits().len(), 1);
+        let permit = plane.outstanding_permits().values().next().unwrap().clone();
+        assert_eq!(permit.request(), &requests[1]);
+        plane.finish(&permit, Outcome::Succeeded).unwrap();
+        drop(plane);
+        let (plane, _) = JournaledControlPlane::recover(&path).unwrap();
+        assert_eq!(
+            plane.state(requests[1].scope(), requests[1].id()).unwrap(),
+            RequestState::Succeeded
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }

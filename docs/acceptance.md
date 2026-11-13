@@ -37,6 +37,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --release --locked
 cargo test -p openquick --test cli --locked
+cargo test -p openquick-core --test journal_recovery --locked
 ```
 
 CLI manual smoke:
@@ -85,7 +86,7 @@ These local results describe the implementation files bundled with this record, 
 
 | Area | Current limitation / future evidence required |
 | --- | --- |
-| Durable execution | In-memory only; restart loses state. No journal, recovery, crash injection or power-loss test is implemented |
+| Durable execution | Append-only journal can replay in-process state after restart; no multi-writer exclusion, crash mid-record certification, or power-loss test |
 | Authenticated identity | OBO and Machine are data variants only. No IdP/token/consent/authentication integration |
 | Approver authorization | Trusted library callers provide approvals. No verified human identity, approval UI or role policy |
 | AgentGateway | No process launch, network connection, proxy routing, credential brokerage or retry-policy integration |
@@ -100,3 +101,11 @@ These local results describe the implementation files bundled with this record, 
 ## Next integration gate
 
 Before enabling external writes, add durable intent/outcome storage and restart tests; authenticated user/service context and approver authorization; a real AgentGateway adapter with explicit write retry policy; and cancellation/revocation checks at the actual dispatch boundary. Test credential handling and isolation independently. These are remaining work, not security properties supplied by the current unavailable gateway.
+
+### Journal scope isolation
+
+Outstanding permits use `(SessionScope, RequestId)` keys, matching the core request namespace. Cancelling a session or cancelling/revoking a request removes only permits in the target scope. Regression tests cover identical IDs across tenants and sessions, restart recovery, terminal replay, and scoped cancellation/revocation. The journal wire format is unchanged; callers of the new draft API must use the scoped key when inspecting `outstanding_permits()` or `replay_events()`. These tests do not certify power-loss recovery or external gateway execution.
+
+### Journal truncation detection
+
+Recovery accepts EOF only at a record boundary. A partial four-byte record length or an incomplete payload returns an I/O `UnexpectedEof` error without changing the journal; callers must not treat that error as successful recovery. Tests cover all one-to-three-byte header tails both with and without a valid prefix, truncated payloads, and missing/empty/complete journals. This is malformed-file detection, not automatic repair, atomic writes, multi-writer exclusion or power-loss certification. The Rust workflow also checks stacked PRs targeting `feat/**`.

@@ -2,7 +2,8 @@ name: Rust
 
 on:
   pull_request:
-    branches: [develop]
+    # Stacked feature PRs need the same checks as PRs targeting develop.
+    branches: [develop, 'feat/**']
   push:
     branches: [develop, 'feat/**']
 

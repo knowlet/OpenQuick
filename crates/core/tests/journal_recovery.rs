@@ -276,3 +276,83 @@ fn cancellation_only_removes_permits_in_target_scope() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[test]
+fn recovery_rejects_partial_record_headers_without_changing_the_file() {
+    for valid_prefix in [false, true] {
+        for header_bytes in 1..=3 {
+            let path = std::env::temp_dir().join(format!(
+                "openquick-partial-header-{valid_prefix}-{header_bytes}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&path);
+            if valid_prefix {
+                let mut plane = JournaledControlPlane::open(&path).unwrap();
+                plane
+                    .create_session(scope("tenant-1", "session-1"))
+                    .unwrap();
+            }
+            let mut bytes = std::fs::read(&path).unwrap_or_default();
+            bytes.extend_from_slice(&[0, 0, 0][..header_bytes]);
+            std::fs::write(&path, &bytes).unwrap();
+
+            assert!(
+                matches!(
+                    JournaledControlPlane::recover(&path),
+                    Err(JournalError::Io(ref err))
+                        if err.kind() == std::io::ErrorKind::UnexpectedEof
+                ),
+                "accepted a {header_bytes}-byte header (valid prefix: {valid_prefix})"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            std::fs::remove_file(&path).unwrap();
+        }
+    }
+}
+
+#[test]
+fn recovery_rejects_truncated_record_payloads_without_changing_the_file() {
+    let path =
+        std::env::temp_dir().join(format!("openquick-partial-payload-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        plane
+            .create_session(scope("tenant-1", "session-1"))
+            .unwrap();
+    }
+    let record = std::fs::read(&path).unwrap();
+    for retained_bytes in 4..record.len() {
+        let truncated = &record[..retained_bytes];
+        std::fs::write(&path, truncated).unwrap();
+        assert!(matches!(
+            JournaledControlPlane::recover(&path),
+            Err(JournalError::Io(ref err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), truncated);
+    }
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn recovery_accepts_missing_empty_and_complete_journals() {
+    let path =
+        std::env::temp_dir().join(format!("openquick-clean-boundary-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let (plane, events) = JournaledControlPlane::recover(&path).unwrap();
+    assert!(events.is_empty());
+    drop(plane);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+    let (mut plane, events) = JournaledControlPlane::recover(&path).unwrap();
+    assert!(events.is_empty());
+    let session = scope("tenant-1", "session-1");
+    plane.create_session(session.clone()).unwrap();
+    drop(plane);
+    let (plane, events) = JournaledControlPlane::recover(&path).unwrap();
+    assert_eq!(events, vec![JournalEvent::CreateSession(session.clone())]);
+    assert!(!plane.session_cancelled(&session).unwrap());
+    drop(plane);
+    std::fs::remove_file(&path).unwrap();
+}

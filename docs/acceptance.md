@@ -105,3 +105,7 @@ Before enabling external writes, add durable intent/outcome storage and restart 
 ### Journal scope isolation
 
 Outstanding permits use `(SessionScope, RequestId)` keys, matching the core request namespace. Cancelling a session or cancelling/revoking a request removes only permits in the target scope. Regression tests cover identical IDs across tenants and sessions, restart recovery, terminal replay, and scoped cancellation/revocation. The journal wire format is unchanged; callers of the new draft API must use the scoped key when inspecting `outstanding_permits()` or `replay_events()`. These tests do not certify power-loss recovery or external gateway execution.
+
+### Journal truncation detection
+
+Recovery accepts EOF only at a record boundary. A partial four-byte record length or an incomplete payload returns an I/O `UnexpectedEof` error without changing the journal; callers must not treat that error as successful recovery. Tests cover all one-to-three-byte header tails both with and without a valid prefix, truncated payloads, and missing/empty/complete journals. This is malformed-file detection, not automatic repair, atomic writes, multi-writer exclusion or power-loss certification. The Rust workflow also checks stacked PRs targeting `feat/**`.

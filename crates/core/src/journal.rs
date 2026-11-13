@@ -270,11 +270,14 @@ impl JournalWriter {
         let mut events = Vec::new();
         loop {
             let mut len_buf = [0_u8; 4];
-            match file.read_exact(&mut len_buf) {
+            // EOF is valid only before a new record starts. A partial length
+            // prefix must not be accepted and later appended to as a clean journal.
+            match file.read_exact(&mut len_buf[..1]) {
                 Ok(()) => {}
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(err) => return Err(err.into()),
             }
+            file.read_exact(&mut len_buf[1..])?;
             let len = u32::from_be_bytes(len_buf) as usize;
             let mut payload = vec![0_u8; len];
             file.read_exact(&mut payload)?;

@@ -1,5 +1,6 @@
 use openquick_core::journal::{
-    JournalError, JournalEvent, JournaledControlPlane, decode_events, encode_events, replay_events,
+    JournalError, JournalEvent, JournaledControlPlane, MAX_RECORD_LEN, decode_events,
+    encode_events, replay_events,
 };
 use openquick_core::{
     Approver, ControlPlane, EffectKind, Identity, Outcome, PrincipalId, RequestId, RequestState,
@@ -355,4 +356,163 @@ fn recovery_accepts_missing_empty_and_complete_journals() {
     assert!(!plane.session_cancelled(&session).unwrap());
     drop(plane);
     std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn open_rejects_a_non_empty_journal() {
+    let path = std::env::temp_dir().join(format!("openquick-open-nonempty-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let session = scope("tenant-1", "session-1");
+    {
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        plane.create_session(session.clone()).unwrap();
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(!bytes.is_empty());
+    assert!(matches!(
+        JournaledControlPlane::open(&path),
+        Err(JournalError::NotEmpty)
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+    let (mut plane, events) = JournaledControlPlane::recover(&path).unwrap();
+    assert_eq!(events, vec![JournalEvent::CreateSession(session.clone())]);
+    assert!(matches!(
+        plane.create_session(session.clone()),
+        Err(JournalError::Replay(openquick_core::Error::SessionExists))
+    ));
+    let other = scope("tenant-1", "session-2");
+    plane.create_session(other.clone()).unwrap();
+    drop(plane);
+    let (plane, events) = JournaledControlPlane::recover(&path).unwrap();
+    assert_eq!(
+        events,
+        vec![
+            JournalEvent::CreateSession(session.clone()),
+            JournalEvent::CreateSession(other),
+        ]
+    );
+    assert!(!plane.session_cancelled(&session).unwrap());
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn replay_finish_rejects_a_different_recorded_request() {
+    let session = scope("tenant-1", "session-1");
+    let request = sample_request(session.clone(), "request-1");
+    let altered = ToolRequest::new(
+        session.clone(),
+        request.id().clone(),
+        request.identity().clone(),
+        request.tool(),
+        "channel-2",
+        request.arguments().to_vec(),
+        request.effect(),
+    )
+    .unwrap();
+    assert_ne!(&altered, &request);
+    let prefix = vec![
+        JournalEvent::CreateSession(session.clone()),
+        JournalEvent::Submit(request.clone()),
+        JournalEvent::Approve {
+            request: request.clone(),
+            approver: Approver::new(session.clone(), PrincipalId::new("reviewer-1").unwrap()),
+        },
+        JournalEvent::Begin(request.clone()),
+    ];
+    let mut mismatched = prefix.clone();
+    mismatched.push(JournalEvent::Finish {
+        request: altered,
+        outcome: Outcome::Succeeded,
+    });
+    let mut core = ControlPlane::new();
+    assert!(matches!(
+        replay_events(&mut core, &mismatched),
+        Err(JournalError::InvalidFormat)
+    ));
+    assert_eq!(
+        core.state(request.scope(), request.id()).unwrap(),
+        RequestState::Executing
+    );
+
+    let mut matched = prefix;
+    matched.push(JournalEvent::Finish {
+        request: request.clone(),
+        outcome: Outcome::Succeeded,
+    });
+    let mut core = ControlPlane::new();
+    assert!(replay_events(&mut core, &matched).unwrap().is_empty());
+    assert_eq!(
+        core.state(request.scope(), request.id()).unwrap(),
+        RequestState::Succeeded
+    );
+}
+
+#[test]
+fn recovery_rejects_oversized_record_lengths_without_allocating_them() {
+    let path =
+        std::env::temp_dir().join(format!("openquick-oversize-record-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    for claimed in [u32::MAX, u32::try_from(MAX_RECORD_LEN).unwrap() + 1] {
+        let bytes = claimed.to_be_bytes().to_vec();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            matches!(
+                JournaledControlPlane::recover(&path),
+                Err(JournalError::InvalidFormat)
+            ),
+            "length {claimed} was not rejected before a short payload read"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let mut blob = b"OQJ1".to_vec();
+        blob.extend_from_slice(&bytes);
+        assert!(matches!(
+            decode_events(&blob),
+            Err(JournalError::InvalidFormat)
+        ));
+    }
+
+    std::fs::write(&path, 1u32.to_be_bytes()).unwrap();
+    assert!(matches!(
+        JournaledControlPlane::recover(&path),
+        Err(JournalError::Io(ref err)) if err.kind() == std::io::ErrorKind::UnexpectedEof
+    ));
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
+fn largest_valid_event_round_trips_under_the_record_cap() {
+    let name = "a".repeat(128);
+    let field = "b".repeat(1024);
+    let session = scope(&name, &name);
+    let request = ToolRequest::new(
+        session.clone(),
+        RequestId::new(&name).unwrap(),
+        Identity::OnBehalfOf {
+            subject: PrincipalId::new(&name).unwrap(),
+        },
+        &field,
+        &field,
+        vec![7_u8; 65_536],
+        EffectKind::ExternalWrite,
+    )
+    .unwrap();
+    let event = JournalEvent::Approve {
+        request,
+        approver: Approver::new(session, PrincipalId::new(&name).unwrap()),
+    };
+    let encoded = encode_events(std::slice::from_ref(&event)).unwrap();
+    let payload_len = encoded.len() - 8;
+    assert!(payload_len > 65_536);
+    assert!(payload_len <= MAX_RECORD_LEN);
+    assert_eq!(decode_events(&encoded).unwrap(), vec![event]);
+}
+
+#[test]
+fn journaled_control_plane_does_not_expose_an_unjournaled_mutator() {
+    let source = include_str!("../src/journal.rs");
+    assert!(
+        !source.contains("fn inner_mut"),
+        "inner_mut would mutate the control plane without appending a journal record"
+    );
 }

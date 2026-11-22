@@ -262,14 +262,14 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Entry {
     request: ToolRequest,
     approval: Option<Approval>,
     state: RequestState,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Session {
     cancelled: bool,
     requests: BTreeMap<RequestId, Entry>,
@@ -285,6 +285,18 @@ pub struct ControlPlane {
 impl ControlPlane {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Deep-copies session state while keeping the same permit issuer.
+    ///
+    /// Journal publication applies mutations on this copy and installs it only
+    /// after the record is synced, so a failed append leaves the live plane
+    /// unchanged. Permits stay valid because the issuer `Arc` is shared.
+    pub(crate) fn snapshot(&self) -> Self {
+        Self {
+            issuer: Arc::clone(&self.issuer),
+            sessions: self.sessions.clone(),
+        }
     }
 
     pub fn create_session(&mut self, scope: SessionScope) -> Result<(), Error> {

@@ -1,12 +1,18 @@
 //! Append-only journal for control-plane events.
 //!
-//! Records successful mutations for process restart. Replay re-invokes the public
-//! API where possible; in-flight permits are re-issued on reload. This is not a
-//! crash-safe or multi-writer store; callers must serialize access.
+//! A mutation is published only after its record has been appended and synced.
+//! The live control plane is left unchanged when that write fails, and the file
+//! is truncated back to the previous record boundary. If that boundary cannot be
+//! made durable, the in-process journal is poisoned and later mutations fail.
+//! Replay re-invokes the public API where possible; in-flight permits are
+//! re-issued on reload. This is not a crash-safe or multi-writer store; callers
+//! must serialize access. A crash can still leave a torn tail, which recovery
+//! rejects instead of repairing.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::{
@@ -15,6 +21,15 @@ use crate::{
 };
 
 const MAGIC: &[u8; 4] = b"OQJ1";
+
+/// Largest record payload recovery will allocate.
+///
+/// A valid event is much smaller: argument bytes are capped at 64 KiB and the
+/// other request fields are short identifiers or 1 KiB tool and target strings.
+/// Length prefixes above this limit are rejected before the payload is allocated.
+pub const MAX_RECORD_LEN: usize = 128 * 1024;
+
+type PermitMap = BTreeMap<(SessionScope, RequestId), ExecutionPermit>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JournalEvent {
@@ -45,6 +60,12 @@ pub enum JournalError {
     Io(io::Error),
     InvalidFormat,
     Replay(Error),
+    /// `open` was called on a journal that already contains bytes.
+    /// Load it with [`JournaledControlPlane::recover`].
+    NotEmpty,
+    /// An append failed and the previous record boundary could not be made durable.
+    /// Further mutations on this instance are rejected.
+    Poisoned,
 }
 
 impl fmt::Display for JournalError {
@@ -53,6 +74,12 @@ impl fmt::Display for JournalError {
             Self::Io(err) => write!(formatter, "journal I/O error: {err}"),
             Self::InvalidFormat => formatter.write_str("journal record format is invalid"),
             Self::Replay(err) => write!(formatter, "journal replay failed: {err}"),
+            Self::NotEmpty => {
+                formatter.write_str("journal is not empty; recover it before appending")
+            }
+            Self::Poisoned => formatter.write_str(
+                "journal is poisoned because its record boundary could not be made durable",
+            ),
         }
     }
 }
@@ -73,23 +100,31 @@ impl From<io::Error> for JournalError {
     }
 }
 
-use std::fmt;
-
-/// Trusted in-process control plane that appends each successful mutation.
+/// Trusted in-process control plane that journals each published mutation.
 #[derive(Debug)]
 pub struct JournaledControlPlane {
     core: ControlPlane,
     journal: JournalWriter,
-    outstanding: BTreeMap<(SessionScope, RequestId), ExecutionPermit>,
+    outstanding: PermitMap,
+    poisoned: bool,
 }
 
 impl JournaledControlPlane {
+    /// Opens a new empty journal.
+    ///
+    /// A file that already contains bytes must be loaded with [`Self::recover`].
+    /// Opening it here would apply later mutations to a blank in-memory plane
+    /// and append them after history that this instance did not replay.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, JournalError> {
         let journal = JournalWriter::open(path)?;
+        if journal.len()? != 0 {
+            return Err(JournalError::NotEmpty);
+        }
         Ok(Self {
             core: ControlPlane::new(),
             journal,
             outstanding: BTreeMap::new(),
+            poisoned: false,
         })
     }
 
@@ -103,6 +138,7 @@ impl JournaledControlPlane {
                 core,
                 journal,
                 outstanding,
+                poisoned: false,
             },
             events,
         ))
@@ -117,29 +153,38 @@ impl JournaledControlPlane {
         &self.core
     }
 
-    pub fn inner_mut(&mut self) -> &mut ControlPlane {
-        &mut self.core
-    }
-
-    fn record(&mut self, event: JournalEvent) -> Result<(), JournalError> {
-        self.journal.append(&event)?;
-        Ok(())
+    /// Applies `mutate` to a staged copy and publishes that copy only after
+    /// `event` has been appended and synced.
+    fn publish<T>(
+        &mut self,
+        event: &JournalEvent,
+        mutate: impl FnOnce(&mut ControlPlane, &mut PermitMap) -> Result<T, Error>,
+    ) -> Result<T, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned);
+        }
+        let mut staged_core = self.core.snapshot();
+        let mut staged_permits = self.outstanding.clone();
+        let value = mutate(&mut staged_core, &mut staged_permits).map_err(JournalError::Replay)?;
+        if let Err(err) = self.journal.append(event) {
+            self.poisoned = self.journal.poisoned;
+            return Err(err);
+        }
+        self.core = staged_core;
+        self.outstanding = staged_permits;
+        Ok(value)
     }
 
     pub fn create_session(&mut self, scope: SessionScope) -> Result<(), JournalError> {
-        self.core
-            .create_session(scope.clone())
-            .map_err(JournalError::Replay)?;
-        self.record(JournalEvent::CreateSession(scope))?;
-        Ok(())
+        self.publish(&JournalEvent::CreateSession(scope.clone()), |core, _| {
+            core.create_session(scope)
+        })
     }
 
     pub fn submit(&mut self, request: ToolRequest) -> Result<(), JournalError> {
-        self.core
-            .submit(request.clone())
-            .map_err(JournalError::Replay)?;
-        self.record(JournalEvent::Submit(request))?;
-        Ok(())
+        self.publish(&JournalEvent::Submit(request.clone()), |core, _| {
+            core.submit(request)
+        })
     }
 
     pub fn approve(
@@ -147,24 +192,27 @@ impl JournaledControlPlane {
         request: &ToolRequest,
         approver: Approver,
     ) -> Result<(), JournalError> {
-        self.core
-            .approve(request, approver.clone())
-            .map_err(JournalError::Replay)?;
-        self.record(JournalEvent::Approve {
-            request: request.clone(),
-            approver,
-        })?;
-        Ok(())
+        self.publish(
+            &JournalEvent::Approve {
+                request: request.clone(),
+                approver: approver.clone(),
+            },
+            |core, _| core.approve(request, approver),
+        )
     }
 
     pub fn begin(&mut self, request: &ToolRequest) -> Result<ExecutionPermit, JournalError> {
-        let permit = self.core.begin(request).map_err(JournalError::Replay)?;
-        self.outstanding.insert(
-            (request.scope().clone(), request.id().clone()),
-            permit.clone(),
-        );
-        self.record(JournalEvent::Begin(request.clone()))?;
-        Ok(permit)
+        self.publish(
+            &JournalEvent::Begin(request.clone()),
+            |core, outstanding| {
+                let permit = core.begin(request)?;
+                outstanding.insert(
+                    (request.scope().clone(), request.id().clone()),
+                    permit.clone(),
+                );
+                Ok(permit)
+            },
+        )
     }
 
     pub fn finish(
@@ -173,13 +221,17 @@ impl JournaledControlPlane {
         outcome: Outcome,
     ) -> Result<(), JournalError> {
         let request = permit.request().clone();
-        self.core
-            .finish(permit, outcome)
-            .map_err(JournalError::Replay)?;
-        self.outstanding
-            .remove(&(request.scope().clone(), request.id().clone()));
-        self.record(JournalEvent::Finish { request, outcome })?;
-        Ok(())
+        self.publish(
+            &JournalEvent::Finish {
+                request: request.clone(),
+                outcome,
+            },
+            |core, outstanding| {
+                core.finish(permit, outcome)?;
+                outstanding.remove(&(request.scope().clone(), request.id().clone()));
+                Ok(())
+            },
+        )
     }
 
     pub fn cancel_request(
@@ -187,15 +239,17 @@ impl JournaledControlPlane {
         scope: &SessionScope,
         id: &RequestId,
     ) -> Result<(), JournalError> {
-        self.core
-            .cancel_request(scope, id)
-            .map_err(JournalError::Replay)?;
-        self.outstanding.remove(&(scope.clone(), id.clone()));
-        self.record(JournalEvent::CancelRequest {
-            scope: scope.clone(),
-            id: id.clone(),
-        })?;
-        Ok(())
+        self.publish(
+            &JournalEvent::CancelRequest {
+                scope: scope.clone(),
+                id: id.clone(),
+            },
+            |core, outstanding| {
+                core.cancel_request(scope, id)?;
+                outstanding.remove(&(scope.clone(), id.clone()));
+                Ok(())
+            },
+        )
     }
 
     pub fn revoke_approval(
@@ -203,25 +257,28 @@ impl JournaledControlPlane {
         scope: &SessionScope,
         id: &RequestId,
     ) -> Result<(), JournalError> {
-        self.core
-            .revoke_approval(scope, id)
-            .map_err(JournalError::Replay)?;
-        self.outstanding.remove(&(scope.clone(), id.clone()));
-        self.record(JournalEvent::RevokeApproval {
-            scope: scope.clone(),
-            id: id.clone(),
-        })?;
-        Ok(())
+        self.publish(
+            &JournalEvent::RevokeApproval {
+                scope: scope.clone(),
+                id: id.clone(),
+            },
+            |core, outstanding| {
+                core.revoke_approval(scope, id)?;
+                outstanding.remove(&(scope.clone(), id.clone()));
+                Ok(())
+            },
+        )
     }
 
     pub fn cancel_session(&mut self, scope: &SessionScope) -> Result<(), JournalError> {
-        self.core
-            .cancel_session(scope)
-            .map_err(JournalError::Replay)?;
-        self.outstanding
-            .retain(|(permit_scope, _), _| permit_scope != scope);
-        self.record(JournalEvent::CancelSession(scope.clone()))?;
-        Ok(())
+        self.publish(
+            &JournalEvent::CancelSession(scope.clone()),
+            |core, outstanding| {
+                core.cancel_session(scope)?;
+                outstanding.retain(|(permit_scope, _), _| permit_scope != scope);
+                Ok(())
+            },
+        )
     }
 
     pub fn state(&self, scope: &SessionScope, id: &RequestId) -> Result<RequestState, Error> {
@@ -236,6 +293,22 @@ impl JournaledControlPlane {
 #[derive(Debug)]
 struct JournalWriter {
     file: File,
+    poisoned: bool,
+    #[cfg(test)]
+    faults: AppendFaults,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct AppendFaults {
+    /// Write only this many bytes of the next record, then fail with `StorageFull`.
+    partial_write: Option<usize>,
+    /// Write the full next record, then fail before its `sync_all`.
+    fail_sync: bool,
+    /// Restoring the pre-append length fails before `set_len`.
+    fail_restore_truncate: bool,
+    /// `set_len` succeeds and the following boundary sync fails.
+    fail_restore_sync: bool,
 }
 
 impl JournalWriter {
@@ -250,14 +323,78 @@ impl JournalWriter {
             .append(true)
             .read(true)
             .open(path)?;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            poisoned: false,
+            #[cfg(test)]
+            faults: AppendFaults::default(),
+        })
+    }
+
+    fn len(&self) -> Result<u64, JournalError> {
+        Ok(self.file.metadata()?.len())
     }
 
     fn append(&mut self, event: &JournalEvent) -> Result<(), JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned);
+        }
         let encoded = encode_event(event)?;
-        let len = u32::try_from(encoded.len()).map_err(|_| JournalError::InvalidFormat)?;
-        self.file.write_all(&len.to_be_bytes())?;
-        self.file.write_all(&encoded)?;
+        let len = checked_record_len(encoded.len())?;
+        let boundary = self.len()?;
+        let mut record = Vec::with_capacity(4 + encoded.len());
+        record.extend_from_slice(&len.to_be_bytes());
+        record.extend_from_slice(&encoded);
+        if let Err(err) = self.write_record(&record) {
+            return self.fail_append(boundary, err);
+        }
+        Ok(())
+    }
+
+    fn write_record(&mut self, record: &[u8]) -> Result<(), JournalError> {
+        #[cfg(test)]
+        if let Some(partial) = self.faults.partial_write.take() {
+            let written = partial.min(record.len());
+            if written > 0 {
+                self.file.write_all(&record[..written])?;
+            }
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "disk full").into());
+        }
+        self.file.write_all(record)?;
+        #[cfg(test)]
+        if self.faults.fail_sync {
+            self.faults.fail_sync = false;
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "sync failed").into());
+        }
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Drops a failed record. Poisons this writer when the previous boundary
+    /// cannot be truncated and synced, so later appends cannot extend a torn tail.
+    fn fail_append(&mut self, boundary: u64, err: JournalError) -> Result<(), JournalError> {
+        match self.restore_boundary(boundary) {
+            Ok(()) => Err(err),
+            Err(_) => {
+                self.poisoned = true;
+                Err(JournalError::Poisoned)
+            }
+        }
+    }
+
+    fn restore_boundary(&mut self, boundary: u64) -> Result<(), JournalError> {
+        #[cfg(test)]
+        if self.faults.fail_restore_truncate {
+            self.faults.fail_restore_truncate = false;
+            return Err(io::Error::other("journal truncate failed").into());
+        }
+        self.file.set_len(boundary)?;
+        self.file.seek(SeekFrom::Start(boundary))?;
+        #[cfg(test)]
+        if self.faults.fail_restore_sync {
+            self.faults.fail_restore_sync = false;
+            return Err(io::Error::new(io::ErrorKind::StorageFull, "truncate sync failed").into());
+        }
         self.file.sync_all()?;
         Ok(())
     }
@@ -278,7 +415,7 @@ impl JournalWriter {
                 Err(err) => return Err(err.into()),
             }
             file.read_exact(&mut len_buf[1..])?;
-            let len = u32::from_be_bytes(len_buf) as usize;
+            let len = checked_record_len(u32::from_be_bytes(len_buf) as usize)? as usize;
             let mut payload = vec![0_u8; len];
             file.read_exact(&mut payload)?;
             events.push(decode_event(&payload)?);
@@ -287,12 +424,20 @@ impl JournalWriter {
     }
 }
 
+fn checked_record_len(len: usize) -> Result<u32, JournalError> {
+    let len = u32::try_from(len).map_err(|_| JournalError::InvalidFormat)?;
+    if len as usize > MAX_RECORD_LEN {
+        return Err(JournalError::InvalidFormat);
+    }
+    Ok(len)
+}
+
 pub fn encode_events(events: &[JournalEvent]) -> Result<Vec<u8>, JournalError> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     for event in events {
         let encoded = encode_event(event)?;
-        let len = u32::try_from(encoded.len()).map_err(|_| JournalError::InvalidFormat)?;
+        let len = checked_record_len(encoded.len())?;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&encoded);
     }
@@ -310,7 +455,8 @@ pub fn decode_events(bytes: &[u8]) -> Result<Vec<JournalEvent>, JournalError> {
             return Err(JournalError::InvalidFormat);
         }
         let (len_bytes, rest) = cursor.split_at(4);
-        let len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
+        let len = checked_record_len(u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize)?
+            as usize;
         cursor = rest;
         if cursor.len() < len {
             return Err(JournalError::InvalidFormat);
@@ -345,9 +491,12 @@ pub fn replay_events(
                 permits.insert((request.scope().clone(), request.id().clone()), permit);
             }
             JournalEvent::Finish { request, outcome } => {
-                let permit = permits
-                    .remove(&(request.scope().clone(), request.id().clone()))
-                    .ok_or(JournalError::InvalidFormat)?;
+                let key = (request.scope().clone(), request.id().clone());
+                let permit = permits.get(&key).ok_or(JournalError::InvalidFormat)?;
+                if permit.request() != request {
+                    return Err(JournalError::InvalidFormat);
+                }
+                let permit = permits.remove(&key).ok_or(JournalError::InvalidFormat)?;
                 core.finish(&permit, *outcome)
                     .map_err(JournalError::Replay)?;
             }
@@ -645,4 +794,250 @@ fn read_bytes(bytes: &[u8]) -> Result<(Vec<u8>, &[u8]), JournalError> {
     }
     let (value, rest) = bytes[4..].split_at(len);
     Ok((value.to_vec(), rest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JournalError, JournalEvent, JournalWriter, JournaledControlPlane};
+    use crate::{
+        Approver, EffectKind, Error, Identity, Outcome, PrincipalId, RequestId, RequestState,
+        SessionId, SessionScope, TenantId, ToolRequest,
+    };
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("openquick-journal-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn scope(tenant: &str, session: &str) -> SessionScope {
+        SessionScope::new(
+            TenantId::new(tenant).unwrap(),
+            SessionId::new(session).unwrap(),
+        )
+    }
+
+    fn request(scope: SessionScope, id: &str) -> ToolRequest {
+        ToolRequest::new(
+            scope,
+            RequestId::new(id).unwrap(),
+            Identity::OnBehalfOf {
+                subject: PrincipalId::new("user-1").unwrap(),
+            },
+            "send_message",
+            "channel-1",
+            br#"{"message":"hello"}"#.to_vec(),
+            EffectKind::ExternalWrite,
+        )
+        .unwrap()
+    }
+
+    fn storage_full(err: &JournalError) -> bool {
+        matches!(err, JournalError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
+    }
+
+    fn file_len(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn failed_append_keeps_memory_and_journal_on_the_previous_boundary() {
+        let path = temp_path("append-rollback");
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        let kept = scope("tenant-1", "session-kept");
+        let failed = scope("tenant-1", "session-failed");
+        plane.create_session(kept.clone()).unwrap();
+        let boundary = file_len(&path);
+        assert!(boundary > 0);
+
+        plane.journal.faults.partial_write = Some(1);
+        let err = plane.create_session(failed.clone()).unwrap_err();
+        assert!(storage_full(&err), "{err}");
+        assert!(matches!(
+            plane.session_cancelled(&failed),
+            Err(Error::UnknownSession)
+        ));
+        assert!(!plane.session_cancelled(&kept).unwrap());
+        assert_eq!(file_len(&path), boundary, "partial append left a torn tail");
+        assert!(!plane.poisoned);
+
+        plane.create_session(failed.clone()).unwrap();
+        let events = JournalWriter::read_all(&path).unwrap();
+        assert_eq!(
+            events,
+            vec![
+                JournalEvent::CreateSession(kept.clone()),
+                JournalEvent::CreateSession(failed.clone()),
+            ]
+        );
+        drop(plane);
+        let (recovered, events) = JournaledControlPlane::recover(&path).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(!recovered.session_cancelled(&kept).unwrap());
+        assert!(!recovered.session_cancelled(&failed).unwrap());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn unsynced_append_is_not_published() {
+        let path = temp_path("sync-rollback");
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        let kept = scope("tenant-1", "session-kept");
+        let failed = scope("tenant-1", "session-unsynced");
+        plane.create_session(kept.clone()).unwrap();
+        let boundary = file_len(&path);
+
+        plane.journal.faults.fail_sync = true;
+        let err = plane.create_session(failed.clone()).unwrap_err();
+        assert!(storage_full(&err), "{err}");
+        assert!(matches!(
+            plane.session_cancelled(&failed),
+            Err(Error::UnknownSession)
+        ));
+        assert_eq!(file_len(&path), boundary);
+        assert!(!plane.poisoned);
+
+        plane.create_session(failed.clone()).unwrap();
+        assert!(!plane.session_cancelled(&failed).unwrap());
+        assert_eq!(JournalWriter::read_all(&path).unwrap().len(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn unrestorable_boundary_poisons_later_mutations() {
+        let path = temp_path("poison-truncate");
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        let kept = scope("tenant-1", "session-kept");
+        let failed = scope("tenant-1", "session-poison");
+        plane.create_session(kept.clone()).unwrap();
+        let boundary = file_len(&path);
+
+        plane.journal.faults.partial_write = Some(1);
+        plane.journal.faults.fail_restore_truncate = true;
+        assert!(matches!(
+            plane.create_session(failed.clone()),
+            Err(JournalError::Poisoned)
+        ));
+        assert!(plane.poisoned);
+        assert!(matches!(
+            plane.session_cancelled(&failed),
+            Err(Error::UnknownSession)
+        ));
+        assert!(!plane.session_cancelled(&kept).unwrap());
+        let torn = file_len(&path);
+        assert!(
+            torn > boundary,
+            "torn tail should remain when truncate fails"
+        );
+
+        assert!(matches!(
+            plane.create_session(scope("tenant-1", "session-later")),
+            Err(JournalError::Poisoned)
+        ));
+        assert_eq!(file_len(&path), torn, "poisoned journal must not append");
+        drop(plane);
+        assert!(matches!(
+            JournaledControlPlane::recover(&path),
+            Err(JournalError::Io(ref err)) if err.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn unsynced_truncate_poisons_even_if_the_length_was_restored() {
+        let path = temp_path("poison-sync");
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        let failed = scope("tenant-1", "session-poison-sync");
+        plane.journal.faults.fail_sync = true;
+        plane.journal.faults.fail_restore_sync = true;
+        assert!(matches!(
+            plane.create_session(failed.clone()),
+            Err(JournalError::Poisoned)
+        ));
+        assert!(matches!(
+            plane.session_cancelled(&failed),
+            Err(Error::UnknownSession)
+        ));
+        assert_eq!(file_len(&path), 0);
+        assert!(matches!(
+            plane.create_session(failed),
+            Err(JournalError::Poisoned)
+        ));
+        assert_eq!(file_len(&path), 0);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn rejected_mutation_does_not_append() {
+        let path = temp_path("reject-no-append");
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        let session = scope("tenant-1", "session-1");
+        plane.create_session(session.clone()).unwrap();
+        let boundary = file_len(&path);
+        assert!(matches!(
+            plane.create_session(session),
+            Err(JournalError::Replay(Error::SessionExists))
+        ));
+        assert_eq!(file_len(&path), boundary);
+        plane
+            .create_session(scope("tenant-1", "session-2"))
+            .unwrap();
+        assert_eq!(JournalWriter::read_all(&path).unwrap().len(), 2);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn failed_begin_and_finish_do_not_change_permits_or_the_journal() {
+        let path = temp_path("permit-rollback");
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        let request = request(scope("tenant-1", "session-1"), "request-1");
+        plane.create_session(request.scope().clone()).unwrap();
+        plane.submit(request.clone()).unwrap();
+        plane
+            .approve(
+                &request,
+                Approver::new(
+                    request.scope().clone(),
+                    PrincipalId::new("reviewer-1").unwrap(),
+                ),
+            )
+            .unwrap();
+        let boundary = file_len(&path);
+
+        plane.journal.faults.partial_write = Some(1);
+        assert!(storage_full(&plane.begin(&request).unwrap_err()));
+        assert!(plane.outstanding_permits().is_empty());
+        assert_eq!(
+            plane.state(request.scope(), request.id()).unwrap(),
+            RequestState::Approved
+        );
+        assert_eq!(file_len(&path), boundary);
+
+        let permit = plane.begin(&request).unwrap();
+        assert_eq!(plane.outstanding_permits().len(), 1);
+        let executing = file_len(&path);
+        plane.journal.faults.partial_write = Some(1);
+        assert!(storage_full(
+            &plane.finish(&permit, Outcome::Succeeded).unwrap_err()
+        ));
+        assert_eq!(plane.outstanding_permits().len(), 1);
+        assert_eq!(
+            plane.state(request.scope(), request.id()).unwrap(),
+            RequestState::Executing
+        );
+        assert_eq!(file_len(&path), executing);
+
+        plane.finish(&permit, Outcome::Succeeded).unwrap();
+        assert!(plane.outstanding_permits().is_empty());
+        drop(plane);
+        let (recovered, _) = JournaledControlPlane::recover(&path).unwrap();
+        assert_eq!(
+            recovered.state(request.scope(), request.id()).unwrap(),
+            RequestState::Succeeded
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
 }

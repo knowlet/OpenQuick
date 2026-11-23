@@ -318,11 +318,13 @@ impl JournalWriter {
         {
             fs::create_dir_all(parent)?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.create(true).append(true).read(true);
+        // Records hold tenant request arguments and principal IDs: create the
+        // file owner-only from the start, not at the process umask.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options.open(path)?;
         Ok(Self {
             file,
             poisoned: false,
@@ -342,7 +344,13 @@ impl JournalWriter {
         let encoded = encode_event(event)?;
         let len = checked_record_len(encoded.len())?;
         let boundary = self.len()?;
-        let mut record = Vec::with_capacity(4 + encoded.len());
+        let mut record = Vec::with_capacity(MAGIC.len() + 4 + encoded.len());
+        // The file uses the same framing as `encode_events`: the version
+        // header goes in front of the first record, in the same durable write,
+        // so an empty journal stays empty and a failed first append restores 0.
+        if boundary == 0 {
+            record.extend_from_slice(MAGIC);
+        }
         record.extend_from_slice(&len.to_be_bytes());
         record.extend_from_slice(&encoded);
         if let Err(err) = self.write_record(&record) {
@@ -405,6 +413,16 @@ impl JournalWriter {
         }
         let mut file = File::open(path)?;
         let mut events = Vec::new();
+        if file.metadata()?.len() == 0 {
+            return Ok(events);
+        }
+        // A torn header is a torn first append (UnexpectedEof, like a torn
+        // record); any other header is not this format.
+        let mut header = [0_u8; 4];
+        file.read_exact(&mut header)?;
+        if &header != MAGIC {
+            return Err(JournalError::InvalidFormat);
+        }
         loop {
             let mut len_buf = [0_u8; 4];
             // EOF is valid only before a new record starts. A partial length
@@ -774,7 +792,7 @@ fn read_string(bytes: &[u8]) -> Result<(String, &[u8]), JournalError> {
         return Err(JournalError::InvalidFormat);
     }
     let len = u16::from_be_bytes(bytes[..2].try_into().unwrap()) as usize;
-    if bytes.len() < 2 + len {
+    if len > bytes.len() - 2 {
         return Err(JournalError::InvalidFormat);
     }
     let (value, rest) = bytes[2..].split_at(len);
@@ -789,7 +807,9 @@ fn read_bytes(bytes: &[u8]) -> Result<(Vec<u8>, &[u8]), JournalError> {
         return Err(JournalError::InvalidFormat);
     }
     let len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
-    if bytes.len() < 4 + len {
+    // Compare against what remains rather than `4 + len`, which overflows
+    // for a u32::MAX length on 32-bit targets.
+    if len > bytes.len() - 4 {
         return Err(JournalError::InvalidFormat);
     }
     let (value, rest) = bytes[4..].split_at(len);
@@ -798,6 +818,25 @@ fn read_bytes(bytes: &[u8]) -> Result<(Vec<u8>, &[u8]), JournalError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inner_lengths_beyond_the_record_are_rejected_without_arithmetic_overflow() {
+        use super::{JournalError, read_bytes, read_string};
+        let mut record = u32::MAX.to_be_bytes().to_vec();
+        record.extend_from_slice(b"short");
+        assert!(matches!(
+            read_bytes(&record),
+            Err(JournalError::InvalidFormat)
+        ));
+        assert!(matches!(
+            read_string(&[0xff, 0xff, b'x']),
+            Err(JournalError::InvalidFormat)
+        ));
+        let (value, rest) = read_bytes(&[0, 0, 0, 2, b'o', b'k', b'!']).unwrap();
+        assert_eq!(
+            (value.as_slice(), rest),
+            (b"ok".as_slice(), b"!".as_slice())
+        );
+    }
     use super::{JournalError, JournalEvent, JournalWriter, JournaledControlPlane};
     use crate::{
         Approver, EffectKind, Error, Identity, Outcome, PrincipalId, RequestId, RequestState,

@@ -323,7 +323,10 @@ fn recovery_rejects_truncated_record_payloads_without_changing_the_file() {
             .unwrap();
     }
     let record = std::fs::read(&path).unwrap();
-    for retained_bytes in 4..record.len() {
+    // The first four bytes are the OQJ1 header; a header alone is a clean
+    // empty journal, so every longer prefix is a torn record.
+    assert_eq!(&record[..4], b"OQJ1");
+    for retained_bytes in 5..record.len() {
         let truncated = &record[..retained_bytes];
         std::fs::write(&path, truncated).unwrap();
         assert!(matches!(
@@ -454,7 +457,8 @@ fn recovery_rejects_oversized_record_lengths_without_allocating_them() {
         std::env::temp_dir().join(format!("openquick-oversize-record-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     for claimed in [u32::MAX, u32::try_from(MAX_RECORD_LEN).unwrap() + 1] {
-        let bytes = claimed.to_be_bytes().to_vec();
+        let mut bytes = b"OQJ1".to_vec();
+        bytes.extend_from_slice(&claimed.to_be_bytes());
         std::fs::write(&path, &bytes).unwrap();
         assert!(
             matches!(
@@ -464,15 +468,13 @@ fn recovery_rejects_oversized_record_lengths_without_allocating_them() {
             "length {claimed} was not rejected before a short payload read"
         );
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
-        let mut blob = b"OQJ1".to_vec();
-        blob.extend_from_slice(&bytes);
         assert!(matches!(
-            decode_events(&blob),
+            decode_events(&bytes),
             Err(JournalError::InvalidFormat)
         ));
     }
 
-    std::fs::write(&path, 1u32.to_be_bytes()).unwrap();
+    std::fs::write(&path, [b"OQJ1".as_slice(), &1u32.to_be_bytes()].concat()).unwrap();
     assert!(matches!(
         JournaledControlPlane::recover(&path),
         Err(JournalError::Io(ref err)) if err.kind() == std::io::ErrorKind::UnexpectedEof
@@ -515,4 +517,54 @@ fn journaled_control_plane_does_not_expose_an_unjournaled_mutator() {
         !source.contains("fn inner_mut"),
         "inner_mut would mutate the control plane without appending a journal record"
     );
+}
+
+#[test]
+fn journal_files_and_the_event_codec_share_one_format() {
+    let dir = std::env::temp_dir().join(format!("openquick-interop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let written = dir.join("written.journal");
+    let session = scope("tenant-1", "session-1");
+    {
+        let mut plane = JournaledControlPlane::open(&written).unwrap();
+        plane.create_session(session.clone()).unwrap();
+        plane.cancel_session(&session).unwrap();
+    }
+    // A file the writer produced decodes with the public codec ...
+    let events = decode_events(&std::fs::read(&written).unwrap()).unwrap();
+    assert_eq!(events.len(), 2);
+    // ... and codec output recovers as a journal and stays appendable.
+    let saved = dir.join("saved.journal");
+    std::fs::write(&saved, encode_events(&events).unwrap()).unwrap();
+    let (mut plane, recovered) = JournaledControlPlane::recover(&saved).unwrap();
+    assert_eq!(recovered, events);
+    assert!(plane.session_cancelled(&session).unwrap());
+    let other = scope("tenant-1", "session-2");
+    plane.create_session(other.clone()).unwrap();
+    drop(plane);
+    let (_, recovered) = JournaledControlPlane::recover(&saved).unwrap();
+    assert_eq!(recovered.last(), Some(&JournalEvent::CreateSession(other)));
+    // A header with no records is an empty history in both paths.
+    assert!(decode_events(b"OQJ1").unwrap().is_empty());
+    std::fs::write(&saved, b"OQJ1").unwrap();
+    assert!(JournaledControlPlane::recover(&saved).unwrap().1.is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_journal_files_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::temp_dir().join(format!("openquick-mode-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    // Under a common 022 umask the file would otherwise be 0644.
+    let mut plane = JournaledControlPlane::open(&path).unwrap();
+    plane
+        .create_session(scope("tenant-1", "session-1"))
+        .unwrap();
+    drop(plane);
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "journal mode {mode:o}");
+    std::fs::remove_file(&path).unwrap();
 }

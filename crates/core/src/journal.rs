@@ -463,6 +463,12 @@ pub fn encode_events(events: &[JournalEvent]) -> Result<Vec<u8>, JournalError> {
 }
 
 pub fn decode_events(bytes: &[u8]) -> Result<Vec<JournalEvent>, JournalError> {
+    // A journal file gets its header with its first record, so a freshly
+    // opened journal is zero bytes. Recovery treats that as empty history;
+    // the codec must agree.
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
     if bytes.len() < MAGIC.len() || &bytes[..MAGIC.len()] != MAGIC {
         return Err(JournalError::InvalidFormat);
     }

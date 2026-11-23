@@ -545,6 +545,14 @@ fn journal_files_and_the_event_codec_share_one_format() {
     drop(plane);
     let (_, recovered) = JournaledControlPlane::recover(&saved).unwrap();
     assert_eq!(recovered.last(), Some(&JournalEvent::CreateSession(other)));
+    // A journal opened but never written is zero bytes; both paths read it
+    // as an empty history.
+    let fresh = dir.join("fresh.journal");
+    drop(JournaledControlPlane::open(&fresh).unwrap());
+    let fresh_bytes = std::fs::read(&fresh).unwrap();
+    assert!(fresh_bytes.is_empty());
+    assert!(decode_events(&fresh_bytes).unwrap().is_empty());
+    assert!(JournaledControlPlane::recover(&fresh).unwrap().1.is_empty());
     // A header with no records is an empty history in both paths.
     assert!(decode_events(b"OQJ1").unwrap().is_empty());
     std::fs::write(&saved, b"OQJ1").unwrap();

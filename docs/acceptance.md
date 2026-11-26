@@ -37,6 +37,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo build --workspace --release --locked
 cargo test -p openquick --test cli --locked
+cargo test -p openquick-core --test journal_recovery --locked
 ```
 
 CLI manual smoke:
@@ -85,7 +86,7 @@ These local results describe the implementation files bundled with this record, 
 
 | Area | Current limitation / future evidence required |
 | --- | --- |
-| Durable execution | In-memory only; restart loses state. No journal, recovery, crash injection or power-loss test is implemented |
+| Durable execution | Append-only journal can replay in-process state after restart; no multi-writer exclusion, crash mid-record certification, or power-loss test |
 | Authenticated identity | OBO and Machine are data variants only. No IdP/token/consent/authentication integration |
 | Approver authorization | Trusted library callers provide approvals. No verified human identity, approval UI or role policy |
 | AgentGateway | No process launch, network connection, proxy routing, credential brokerage or retry-policy integration |
@@ -100,3 +101,15 @@ These local results describe the implementation files bundled with this record, 
 ## Next integration gate
 
 Before enabling external writes, add durable intent/outcome storage and restart tests; authenticated user/service context and approver authorization; a real AgentGateway adapter with explicit write retry policy; and cancellation/revocation checks at the actual dispatch boundary. Test credential handling and isolation independently. These are remaining work, not security properties supplied by the current unavailable gateway.
+
+### Journal scope isolation
+
+Outstanding permits use `(SessionScope, RequestId)` keys, matching the core request namespace. Cancelling a session or cancelling/revoking a request removes only permits in the target scope. Regression tests cover identical IDs across tenants and sessions, restart recovery, terminal replay, and scoped cancellation/revocation. Scope isolation does not change how events are encoded; callers of the new draft API must use the scoped key when inspecting `outstanding_permits()` or `replay_events()`. These tests do not certify power-loss recovery or external gateway execution.
+
+### Journal truncation detection
+
+A journal file starts with the 4-byte `OQJ1` header, written together with its first record; a zero-byte file (opened, never written) is an empty history, recovery reports a file shorter than the header as `UnexpectedEof`, and any other header returns `InvalidFormat`. Files written by earlier drafts of this PR had no header and are rejected. Recovery accepts EOF only at a record boundary. A partial four-byte record length or an incomplete payload returns an I/O `UnexpectedEof` error without changing the journal; callers must not treat that error as successful recovery. A length prefix above `MAX_RECORD_LEN` (128 KiB) returns `InvalidFormat` before the payload is allocated. Tests cover all one-to-three-byte header tails both with and without a valid prefix, truncated payloads, oversized lengths, and missing/empty/complete journals. This is malformed-file detection, not automatic repair, atomic writes, multi-writer exclusion or power-loss certification. The Rust workflow also checks stacked PRs targeting `feat/**`.
+
+### Journal publication
+
+`open` accepts only an empty journal. A non-empty file returns `JournalError::NotEmpty` unchanged; `recover` replays it before further appends. Mutations are applied to a staged copy and published only after the record is appended and synced. A failed write or sync discards that copy and attempts to restore the previous record boundary. A retry observes the pre-failure state only after a successful rollback. If truncating or syncing the rollback fails, the affected call returns `JournalError::IndeterminateAppend`. Recovery can replay a complete record from that call; drop the poisoned instance and reconcile the recovered state before retrying. Later mutations on the old instance return `JournalError::Poisoned` without attempting an append. Already published state remains readable. Replayed `Finish` records must repeat the full request on the in-flight permit; a scope and request ID match with any other field different is `InvalidFormat` and leaves the request executing. These paths do not certify crash-mid-write repair, multi-writer exclusion, or power loss.

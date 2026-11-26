@@ -63,8 +63,11 @@ pub enum JournalError {
     /// `open` was called on a journal that already contains bytes.
     /// Load it with [`JournaledControlPlane::recover`].
     NotEmpty,
-    /// An append failed and the previous record boundary could not be made durable.
-    /// Further mutations on this instance are rejected.
+    /// The attempted append and its rollback both failed. Recovery may
+    /// replay the attempted event if its complete frame reached the file.
+    /// Drop this instance and reconcile recovered state before retrying.
+    IndeterminateAppend,
+    /// This instance was already poisoned. This call did not append anything.
     Poisoned,
 }
 
@@ -77,9 +80,10 @@ impl fmt::Display for JournalError {
             Self::NotEmpty => {
                 formatter.write_str("journal is not empty; recover it before appending")
             }
-            Self::Poisoned => formatter.write_str(
-                "journal is poisoned because its record boundary could not be made durable",
+            Self::IndeterminateAppend => formatter.write_str(
+                "journal append outcome is indeterminate; reconcile recovered state before retrying",
             ),
+            Self::Poisoned => formatter.write_str("journal was already poisoned; no append attempted"),
         }
     }
 }
@@ -128,6 +132,9 @@ impl JournaledControlPlane {
         })
     }
 
+    /// Replays complete records from the journal. A torn frame remains an
+    /// error. After an indeterminate append, do not infer the operation's
+    /// result from the previous instance's in-memory state.
     pub fn recover(path: impl AsRef<Path>) -> Result<(Self, Vec<JournalEvent>), JournalError> {
         let events = JournalWriter::read_all(path.as_ref())?;
         let mut core = ControlPlane::new();
@@ -385,7 +392,7 @@ impl JournalWriter {
             Ok(()) => Err(err),
             Err(_) => {
                 self.poisoned = true;
-                Err(JournalError::Poisoned)
+                Err(JournalError::IndeterminateAppend)
             }
         }
     }
@@ -964,7 +971,7 @@ mod tests {
         plane.journal.faults.fail_restore_truncate = true;
         assert!(matches!(
             plane.create_session(failed.clone()),
-            Err(JournalError::Poisoned)
+            Err(JournalError::IndeterminateAppend)
         ));
         assert!(plane.poisoned);
         assert!(matches!(
@@ -1000,7 +1007,7 @@ mod tests {
         plane.journal.faults.fail_restore_sync = true;
         assert!(matches!(
             plane.create_session(failed.clone()),
-            Err(JournalError::Poisoned)
+            Err(JournalError::IndeterminateAppend)
         ));
         assert!(matches!(
             plane.session_cancelled(&failed),
@@ -1012,6 +1019,54 @@ mod tests {
             Err(JournalError::Poisoned)
         ));
         assert_eq!(file_len(&path), 0);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn indeterminate_finish_may_replay_but_later_poisoned_calls_never_append() {
+        let path = temp_path("indeterminate-finish");
+        let mut plane = JournaledControlPlane::open(&path).unwrap();
+        let request = request(scope("tenant-1", "session-1"), "request-1");
+        plane.create_session(request.scope().clone()).unwrap();
+        plane.submit(request.clone()).unwrap();
+        plane
+            .approve(
+                &request,
+                Approver::new(
+                    request.scope().clone(),
+                    PrincipalId::new("reviewer-1").unwrap(),
+                ),
+            )
+            .unwrap();
+        let permit = plane.begin(&request).unwrap();
+        let executing_length = file_len(&path);
+
+        plane.journal.faults.fail_sync = true;
+        plane.journal.faults.fail_restore_truncate = true;
+        assert!(matches!(
+            plane.finish(&permit, Outcome::Succeeded),
+            Err(JournalError::IndeterminateAppend)
+        ));
+        assert_eq!(
+            plane.state(request.scope(), request.id()).unwrap(),
+            RequestState::Executing
+        );
+        assert_eq!(plane.outstanding_permits().len(), 1);
+        let unclear_length = file_len(&path);
+        assert!(unclear_length > executing_length);
+        assert!(matches!(
+            plane.finish(&permit, Outcome::Succeeded),
+            Err(JournalError::Poisoned)
+        ));
+        assert_eq!(file_len(&path), unclear_length);
+
+        drop(plane);
+        let (recovered, _) = JournaledControlPlane::recover(&path).unwrap();
+        assert_eq!(
+            recovered.state(request.scope(), request.id()).unwrap(),
+            RequestState::Succeeded
+        );
+        assert!(recovered.outstanding_permits().is_empty());
         std::fs::remove_file(&path).unwrap();
     }
 
